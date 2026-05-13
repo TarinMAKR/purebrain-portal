@@ -1456,6 +1456,7 @@
     position: relative;
     z-index: 1;
     max-width: 100vw;
+    transition: width 0.25s ease, max-width 0.25s ease;
   }
 
   /* ===== SIDEBAR ===== */
@@ -19045,6 +19046,13 @@ if (window.__welcome3DQueue) {
     TC.open = true;
     var m = document.getElementById('teamchat-modal');
     if (m) { m.style.display='flex'; requestAnimationFrame(function(){ m.classList.add('open'); }); }
+    // Shrink main content so panel doesn't cover it
+    var main = document.querySelector('.main');
+    if (main && window.innerWidth > 900) {
+      main.style.width = 'calc(100vw - 400px)';
+      main.style.maxWidth = 'calc(100vw - 400px)';
+      main.style.flexShrink = '1';
+    }
     tcRefresh();
     tcFetchPresence();
     if (TC.pollHandle) clearInterval(TC.pollHandle);
@@ -19055,6 +19063,13 @@ if (window.__welcome3DQueue) {
     TC.open = false;
     var m = document.getElementById('teamchat-modal');
     if (m) { m.classList.remove('open'); setTimeout(function(){ if (!TC.open) m.style.display='none'; }, 250); }
+    // Restore main content width
+    var main = document.querySelector('.main');
+    if (main) {
+      main.style.width = '';
+      main.style.maxWidth = '100vw';
+      main.style.flexShrink = '';
+    }
     if (TC.pollHandle){ clearInterval(TC.pollHandle); TC.pollHandle=null; }
   };
 
