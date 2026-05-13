@@ -214,24 +214,56 @@ def download_attachment(cfg, attachment):
     return path
 
 
-def inject_prompt_hint(text):
-    """Write a context hint into the AI's tmux session. Mirrors telegram_bridge.py
-    pattern: send-keys to the tmux session named in ~/.current_session.
+def inject_prompt_hint(text, max_retries=3, retry_delay=3):
+    """Write a context hint into the AI's tmux session with Enter-retry.
 
-    Best-effort. Silent fail if no tmux session is available (lab/test runs)."""
+    Sends the text + Enter, then waits and re-sends Enter up to max_retries
+    times if the text appears to still be sitting in the input buffer
+    (i.e., the prompt wasn't ready to accept it).
+
+    Best-effort. Silent fail if no tmux session is available."""
     try:
         if not CURRENT_SESSION_FILE.exists():
             return False
         sess = CURRENT_SESSION_FILE.read_text().strip()
         if not sess:
             return False
-        # Two-step: type the text, then send Enter
+
+        # First attempt: type the text + Enter
         subprocess.run(
             ["tmux", "send-keys", "-t", sess, text, "Enter"],
             check=False,
             timeout=5,
         )
-        return True
+
+        # Retry loop: wait, then send Enter again if needed
+        for attempt in range(max_retries):
+            time.sleep(retry_delay)
+            # Capture the current pane content to check if our text is stuck
+            result = subprocess.run(
+                ["tmux", "capture-pane", "-t", sess, "-p", "-l", "5"],
+                capture_output=True, text=True, timeout=5,
+            )
+            pane_tail = result.stdout.strip() if result.stdout else ""
+            # If our text (or a truncated version) is visible in the last few
+            # lines of the pane, it may be stuck in the input buffer — hit Enter
+            # Check for the room/seq prefix which is distinctive
+            text_prefix = text[:60] if len(text) > 60 else text
+            if text_prefix in pane_tail:
+                log.info("inject retry %d/%d — text still in pane, sending Enter",
+                         attempt + 1, max_retries)
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", sess, "Enter"],
+                    check=False,
+                    timeout=5,
+                )
+            else:
+                # Text is gone from pane — injection succeeded
+                log.debug("inject confirmed after %d retries", attempt)
+                return True
+
+        log.warning("inject exhausted %d retries — text may be stuck", max_retries)
+        return True  # We tried our best
     except Exception as e:
         log.debug("tmux inject failed: %s", e)
         return False
