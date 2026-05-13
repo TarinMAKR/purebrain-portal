@@ -18824,6 +18824,464 @@ if (window.__welcome3DQueue) {
 </script>
 <!-- ===== END AGENT CONTROL HUB ===== -->
 
+<!-- ==================== TEAM CHAT WIDGET (trio-comms integration) ==================== -->
+<!-- Adapted from Aether's trio-widget-v12. Connects to trio-comms CF Worker via
+     portal proxy routes (/trio/messages, /trio/message, /trio/upload, /trio/presence).
+     Participants are dynamic (fetched from /trio/presence), not hardcoded.
+     Auth: portal bearer token from localStorage.portal_token. -->
+
+<!-- Script 1: Image upload, drag-drop, paste -->
+<script>
+(function(){
+  function injectSidebar(){
+    var sidebar = document.querySelector('nav.sidebar');
+    if (!sidebar) return false;
+    if (document.getElementById('nav-teamchat-item')) return true;
+    var footer = sidebar.querySelector('.sidebar-footer');
+    var insertBeforeEl = footer || null;
+    var section = document.createElement('div');
+    section.className = 'sidebar-section';
+    section.textContent = 'Coordination';
+    section.style.marginTop = '12px';
+    var tc = document.createElement('div');
+    tc.id = 'nav-teamchat-item';
+    tc.className = 'nav-item';
+    tc.setAttribute('data-tooltip', 'Team Chat — talk with your AI partners together');
+    tc.style.cursor = 'pointer';
+    tc.innerHTML = '<span class="nav-icon" style="color:#f1420b;">&#x26A1;</span>Team Chat';
+    tc.onclick = function(e){ e.preventDefault(); if (window.openTeamChat) window.openTeamChat(); };
+    if (insertBeforeEl) {
+      sidebar.insertBefore(section, insertBeforeEl);
+      sidebar.insertBefore(tc, insertBeforeEl);
+    } else {
+      sidebar.appendChild(section);
+      sidebar.appendChild(tc);
+    }
+    return true;
+  }
+  function injectMobile(){
+    var mobileMenu = document.getElementById('mobile-more-menu');
+    if (!mobileMenu) return false;
+    if (document.getElementById('mobile-teamchat-item')) return true;
+    var mTC = document.createElement('div');
+    mTC.id = 'mobile-teamchat-item';
+    mTC.className = 'tab-menu-item';
+    mTC.style.cursor = 'pointer';
+    mTC.innerHTML = '<span style="margin-right:10px;color:#f1420b;">&#x26A1;</span>Team Chat';
+    mTC.onclick = function(){
+      if (window.closeMobileMenu) window.closeMobileMenu();
+      setTimeout(function(){ if (window.openTeamChat) window.openTeamChat(); }, 200);
+    };
+    mobileMenu.appendChild(mTC);
+    return true;
+  }
+  function injectNav(){
+    var s = injectSidebar();
+    var m = injectMobile();
+    if (!s || !m) setTimeout(injectNav, 500);
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', injectNav);
+  else injectNav();
+
+  if (!window.TC_WIDGET) window.TC_WIDGET = {};
+  var TC = window.TC_WIDGET;
+  TC.pendingMedia = null;
+  TC.isDragging = false;
+
+  async function tcUploadFile(file){
+    if (file.size > 25 * 1024 * 1024) throw new Error('File too large (max 25MB)');
+    var formData = new FormData();
+    formData.append('file', file);
+    var res = await fetch('/trio/upload', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + (window.tcToken ? window.tcToken() : '') },
+      body: formData
+    });
+    if (!res.ok) {
+      var msg = 'Upload failed (HTTP ' + res.status + ')';
+      try { var j = await res.json(); if (j.error) msg = j.error; } catch(_){}
+      throw new Error(msg);
+    }
+    return await res.json();
+  }
+
+  function tcShowPendingMedia(media){
+    TC.pendingMedia = media;
+    var container = document.getElementById('tc-pending-preview');
+    if (!container) return;
+    var name = _tcEsc(media.filename || media.original_name || 'file');
+    var size = ((media.size||0)/1024).toFixed(1);
+    if (media.mime && media.mime.startsWith('image/')){
+      container.innerHTML = '<div class="tw-pending-item"><img src="'+_tcEsc(media.url)+'" alt="Preview" class="tw-pending-thumb" /><div class="tw-pending-info"><div class="tw-pending-name">'+name+'</div><div class="tw-pending-size">'+size+'KB</div></div><button class="tw-pending-remove" onclick="tcClearPendingMedia()">&times;</button></div>';
+    } else {
+      container.innerHTML = '<div class="tw-pending-item"><span class="tw-pending-icon">&#x1F4CE;</span><div class="tw-pending-info"><div class="tw-pending-name">'+name+'</div><div class="tw-pending-size">'+size+'KB</div></div><button class="tw-pending-remove" onclick="tcClearPendingMedia()">&times;</button></div>';
+    }
+    container.style.display = 'flex';
+  }
+  window.tcClearPendingMedia = function(){
+    TC.pendingMedia = null;
+    var c = document.getElementById('tc-pending-preview');
+    if (c) { c.style.display='none'; c.innerHTML=''; }
+  };
+
+  function _tcEsc(s){return String(s||'').replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]});}
+
+  function tcRenderMedia(message){
+    var atts = message.attachments;
+    if (typeof atts === 'string') try { atts = JSON.parse(atts); } catch(e) { atts = []; }
+    if (!atts || !Array.isArray(atts) || !atts.length) return '';
+    return atts.map(function(a){
+      var url = _tcEsc(a.url || '');
+      var name = _tcEsc(a.filename || 'file');
+      if (a.mime && a.mime.startsWith('image/'))
+        return '<img src="'+url+'" class="tw-msg-img" loading="lazy" onclick="window.open(\''+url+'\',\'_blank\')" alt="'+name+'" />';
+      return '<a href="'+url+'" target="_blank" class="tw-file-link">&#x1F4CE; '+name+'</a>';
+    }).join('');
+  }
+  window.tcRenderMedia = tcRenderMedia;
+  window.tcUploadFile = tcUploadFile;
+  window.tcShowPendingMedia = tcShowPendingMedia;
+})();
+</script>
+
+<!-- Script 2: Main Team Chat widget logic -->
+<script>
+(function(){
+  var TC = window.TC_WIDGET || {};
+  Object.assign(TC, {
+    members: [],       // populated from /trio/presence
+    byId: TC.byId || {},
+    pollHandle: TC.pollHandle || null,
+    open: TC.open || false,
+    lastSeq: 0,
+  });
+  window.TC_WIDGET = TC;
+
+  // Dynamic color palette for participants
+  var MEMBER_COLORS = ['#2a93c1','#f1420b','#c0c0c0','#22c55e','#eab308','#a855f7','#ec4899','#14b8a6'];
+  var _colorMap = {};
+  function memberColor(id){
+    if (_colorMap[id]) return _colorMap[id];
+    var idx = Object.keys(_colorMap).length % MEMBER_COLORS.length;
+    _colorMap[id] = MEMBER_COLORS[idx];
+    return _colorMap[id];
+  }
+  function memberLabel(id){
+    // Strip prefixes: "ai:cust:name" → "name", "human:email" → email local part
+    if (id.startsWith('ai:')) { var parts = id.split(':'); return parts[parts.length-1]; }
+    if (id.startsWith('human:')) return id.replace('human:','').split('@')[0];
+    return id;
+  }
+
+  function tcToken(){
+    try { return localStorage.getItem('portal_token') || ''; } catch(e){ return ''; }
+  }
+  window.tcToken = tcToken;
+  function tcAuth(extra){
+    var h = Object.assign({}, extra || {});
+    var t = tcToken();
+    if (t) h['Authorization'] = 'Bearer ' + t;
+    return h;
+  }
+  function tcEsc(s){return String(s||'').replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]});}
+
+  // Markdown renderer (from Aether's trio-widget)
+  function tcLinkify(s){
+    var raw = String(s || '');
+    var codeBlocks = [];
+    var h = raw.replace(/```(\w+)?\n?([\s\S]*?)```/g, function(m,lang,code){
+      var lc = lang ? ' class="language-'+lang.replace(/[^a-zA-Z0-9]/g,'')+'"' : '';
+      var idx = codeBlocks.length;
+      codeBlocks.push('<pre class="tw-code-block"><code'+lc+'>'+tcEsc(code.replace(/\n$/,''))+'</code></pre>');
+      return '\0CB'+idx+'\0';
+    });
+    h = tcEsc(h);
+    h = h.replace(/`([^`\n]+)`/g, '<code class="tw-inline-code">$1</code>');
+    h = h.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+    h = h.replace(/__([^_\n]+)__/g, '<strong>$1</strong>');
+    h = h.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
+    h = h.replace(/^### (.+)$/gm, '<div class="tw-h3">$1</div>');
+    h = h.replace(/^## (.+)$/gm, '<div class="tw-h2">$1</div>');
+    h = h.replace(/^# (.+)$/gm, '<div class="tw-h1">$1</div>');
+    h = h.replace(/^&gt; (.+)$/gm, '<div class="tw-blockquote">$1</div>');
+    h = h.replace(/^(?:[-*]) (.+)$/gm, '<div class="tw-li">&bull; $1</div>');
+    h = h.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener" style="color:#2a93c1;text-decoration:underline;">$1</a>');
+    h = h.replace(/(?<!["=])(https?:\/\/[^\s<]+)/g, '<a href="$1" target="_blank" rel="noopener" style="color:#2a93c1;text-decoration:underline;">$1</a>');
+    h = h.replace(/\n/g, '<br>');
+    h = h.replace(/\0CB(\d+)\0/g, function(m,idx){ return codeBlocks[parseInt(idx,10)] || ''; });
+    return h;
+  }
+  function tcFmtTs(iso){
+    try { return new Date(iso).toLocaleTimeString('en-US',{timeZone:'America/New_York',hour:'numeric',minute:'2-digit'}); }
+    catch(e){ return ''; }
+  }
+
+  // Highlight.js lazy-load
+  (function(){
+    if (window._tcHljsLoaded) return;
+    window._tcHljsLoaded = true;
+    try {
+      var link = document.createElement('link'); link.rel='stylesheet';
+      link.href='https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github-dark.min.css';
+      document.head.appendChild(link);
+      var s = document.createElement('script');
+      s.src='https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/common.min.js';
+      s.onload=function(){ window._tcHljsReady=true; };
+      document.head.appendChild(s);
+    } catch(e){}
+  })();
+
+  // Mobile touch fix
+  document.addEventListener('touchmove', function(e){
+    if (!TC.open) return;
+    var el = e.target;
+    while (el) { if (el.classList && (el.classList.contains('tw-feed') || el.id==='tc-input' || el.tagName==='TEXTAREA')) return; el=el.parentElement; }
+    e.preventDefault();
+  }, {passive:false});
+
+  var ALL_MESSAGES = [];
+
+  window.openTeamChat = function(){
+    TC.open = true;
+    var m = document.getElementById('teamchat-modal');
+    if (m) { m.style.display='flex'; requestAnimationFrame(function(){ m.classList.add('open'); }); }
+    tcRefresh();
+    tcFetchPresence();
+    if (TC.pollHandle) clearInterval(TC.pollHandle);
+    TC.pollHandle = setInterval(tcRefresh, 10000);
+    setTimeout(function(){ var i=document.getElementById('tc-input'); if(i) i.focus(); }, 300);
+  };
+  window.closeTeamChat = function(){
+    TC.open = false;
+    var m = document.getElementById('teamchat-modal');
+    if (m) { m.classList.remove('open'); setTimeout(function(){ if (!TC.open) m.style.display='none'; }, 250); }
+    if (TC.pollHandle){ clearInterval(TC.pollHandle); TC.pollHandle=null; }
+  };
+
+  async function tcFetchPresence(){
+    try {
+      var res = await fetch('/trio/presence', { headers: tcAuth(), credentials:'same-origin' });
+      if (!res.ok) return;
+      var data = await res.json();
+      var presence = data.presence || [];
+      TC.members = presence;
+      // Update header dots
+      var dots = document.getElementById('tc-dots');
+      if (dots) {
+        dots.innerHTML = presence.map(function(p){
+          var c = p.status==='online' ? '#22c55e' : p.status==='stale' ? '#eab308' : '#ef4444';
+          var label = memberLabel(p.member_id);
+          memberColor(p.member_id); // ensure color assigned
+          return '<span style="width:8px;height:8px;border-radius:50%;background:'+c+';display:inline-block;" title="'+tcEsc(label)+' ('+p.status+')"></span>';
+        }).join('');
+      }
+    } catch(e){ console.warn('[tc] presence error', e); }
+  }
+
+  async function tcRefresh(){
+    try {
+      var url = '/trio/messages?limit=200';
+      if (TC.lastSeq > 0) url += '&since_seq=' + TC.lastSeq;
+      var res = await fetch(url, { headers: tcAuth(), credentials:'same-origin' });
+      if (!res.ok) throw new Error('HTTP '+res.status);
+      var data = await res.json();
+      var msgs = data.messages || [];
+      if (TC.lastSeq === 0) {
+        // First load — full set
+        ALL_MESSAGES = msgs;
+      } else if (msgs.length) {
+        // Incremental — append new
+        var existingIds = new Set(ALL_MESSAGES.map(function(m){ return m.id; }));
+        msgs.forEach(function(m){ if (!existingIds.has(m.id)) ALL_MESSAGES.push(m); });
+      }
+      if (msgs.length) {
+        var maxSeq = msgs.reduce(function(mx,m){ return Math.max(mx, m.seq||0); }, 0);
+        if (maxSeq > TC.lastSeq) TC.lastSeq = maxSeq;
+      }
+      ALL_MESSAGES.sort(function(a,b){ return (a.seq||0)-(b.seq||0); });
+      tcRender(ALL_MESSAGES);
+    } catch(e){
+      console.warn('[tc] refresh error', e);
+      var st = document.getElementById('tc-status');
+      if (st) { st.style.color='var(--red,#ef4444)'; st.textContent='Connection error — '+e.message; }
+    }
+  }
+
+  function tcRender(messages){
+    var feed = document.getElementById('tc-feed');
+    if (!feed) return;
+    var atBottom = Math.abs(feed.scrollTop + feed.clientHeight - feed.scrollHeight) < 40;
+    if (!messages.length){
+      feed.innerHTML = '<div class="tw-empty">No messages yet. Send something to start the team chat.</div>';
+      return;
+    }
+    feed.innerHTML = messages.map(function(m){
+      var sender = m.sender || m.sender_id || 'unknown';
+      var label = memberLabel(sender);
+      var color = memberColor(sender);
+      var isHuman = sender.startsWith('human:');
+      var side = isHuman ? 'right' : 'left';
+      var body = tcLinkify(m.content || '');
+      var mediaHtml = (typeof window.tcRenderMedia === 'function') ? window.tcRenderMedia(m) : '';
+      var fullTs = m.timestamp ? new Date(m.timestamp).toLocaleString('en-US',{timeZone:'America/New_York',weekday:'short',month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}) : '';
+      return '<div class="tw-msg tw-msg-'+side+'">' +
+        '<div class="tw-msg-meta">' +
+          '<span class="tw-sender" style="color:'+color+';">'+tcEsc(label)+'</span>' +
+          '<span class="tw-time" title="'+tcEsc(fullTs)+'">'+tcEsc(tcFmtTs(m.timestamp))+'</span>' +
+        '</div>' +
+        '<div class="tw-msg-body" style="border-color:'+color+'66;">'+body+mediaHtml+'</div>' +
+      '</div>';
+    }).join('');
+    if (atBottom) feed.scrollTop = feed.scrollHeight;
+    // Syntax highlighting
+    if (window._tcHljsReady && window.hljs) {
+      requestAnimationFrame(function(){
+        document.querySelectorAll('#teamchat-modal pre.tw-code-block code:not(.hljs)').forEach(function(el){
+          try { window.hljs.highlightElement(el); } catch(e){}
+        });
+      });
+    }
+  }
+
+  async function tcSend(){
+    var ta = document.getElementById('tc-input');
+    var status = document.getElementById('tc-status');
+    var content = (ta.value||'').trim();
+    var pending = TC.pendingMedia ? [TC.pendingMedia] : [];
+    if (!content && !pending.length) return;
+    status.textContent = 'Sending...';
+    status.style.color = 'var(--text-dim,#7a8aaa)';
+    try {
+      var payload = { content: content || '' };
+      if (pending.length) payload.attachments = pending;
+      var res = await fetch('/trio/message', {
+        method:'POST',
+        headers: tcAuth({'Content-Type':'application/json'}),
+        credentials:'same-origin',
+        body: JSON.stringify(payload)
+      });
+      if (!res.ok){
+        var detail = 'HTTP '+res.status;
+        try { var j = await res.json(); if(j.error) detail=j.error; } catch(_){}
+        throw new Error(detail);
+      }
+      ta.value = '';
+      if (window.tcClearPendingMedia) window.tcClearPendingMedia();
+      status.style.color='var(--green,#22c55e)';
+      status.textContent='Sent.';
+      setTimeout(function(){ status.textContent=''; }, 3000);
+      await tcRefresh();
+    } catch(e){
+      status.style.color='var(--red,#ef4444)';
+      status.textContent='Failed: '+e.message;
+    }
+  }
+  window.tcSend = tcSend;
+
+  document.addEventListener('keydown', function(e){
+    if (!TC.open) return;
+    if (e.key==='Escape') { window.closeTeamChat(); return; }
+    if (e.target && e.target.id==='tc-input' && e.key==='Enter' && !e.shiftKey) { e.preventDefault(); tcSend(); }
+  });
+})();
+</script>
+
+<!-- Team Chat styles (from Aether's trio-widget design) -->
+<style>
+#teamchat-modal{
+  position:fixed;top:0;right:0;bottom:0;width:400px;
+  z-index:99999;display:none;
+  overflow:hidden;touch-action:none;
+  transform:translateX(100%);transition:transform 0.25s ease;
+}
+#teamchat-modal.open{display:flex;transform:translateX(0);}
+#teamchat-modal .tw-shell{
+  width:100%;height:100%;background:#0d1121;
+  border-left:1px solid rgba(42,147,193,0.25);border-radius:0;
+  display:flex;flex-direction:column;overflow:hidden;
+  box-shadow:-8px 0 40px rgba(0,0,0,0.5);color:#e8eaf6;
+}
+#teamchat-modal .tw-header{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:14px 20px;border-bottom:1px solid rgba(255,255,255,0.06);
+  background:linear-gradient(180deg,rgba(42,147,193,0.1),transparent);
+}
+#teamchat-modal .tw-title{font-weight:600;font-size:16px;color:#e8eaf6;display:flex;align-items:center;gap:10px;}
+#teamchat-modal .tw-title .tw-dots{display:inline-flex;gap:4px;}
+#teamchat-modal .tw-close{background:transparent;border:none;color:#7a8aaa;font-size:22px;cursor:pointer;padding:4px 10px;border-radius:6px;}
+#teamchat-modal .tw-close:hover{background:rgba(255,255,255,0.06);color:#e8eaf6;}
+#teamchat-modal .tw-feed{flex:1;overflow-y:auto;padding:18px 20px;display:flex;flex-direction:column;gap:12px;}
+#teamchat-modal .tw-empty{color:#4a5570;font-style:italic;font-size:12px;text-align:center;margin-top:24px;}
+#teamchat-modal .tw-msg{max-width:78%;display:flex;flex-direction:column;gap:3px;}
+#teamchat-modal .tw-msg-right{align-self:flex-end;align-items:flex-end;}
+#teamchat-modal .tw-msg-left{align-self:flex-start;align-items:flex-start;}
+#teamchat-modal .tw-msg-meta{font-size:10px;color:#7a8aaa;font-weight:500;display:flex;gap:8px;align-items:baseline;}
+#teamchat-modal .tw-msg-meta .tw-sender{font-weight:700;font-size:11px;letter-spacing:0.2px;}
+#teamchat-modal .tw-msg-body{font-size:13px;line-height:1.5;color:#e8eaf6;padding:9px 13px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.06);border-radius:10px;word-wrap:break-word;}
+#teamchat-modal .tw-msg-right .tw-msg-body{background:rgba(255,255,255,0.07);}
+#teamchat-modal .tw-msg-body code{background:rgba(255,255,255,0.08);padding:1px 5px;border-radius:4px;font-size:12px;}
+#teamchat-modal .tw-footer{padding:12px 16px;border-top:1px solid rgba(255,255,255,0.06);background:#0a0d1a;}
+#teamchat-modal .tw-input-row{display:flex;gap:10px;align-items:flex-end;}
+#teamchat-modal #tc-input{flex:1;background:#111729;border:1px solid rgba(42,147,193,0.25);color:#e8eaf6;border-radius:10px;padding:14px;font-family:inherit;font-size:16px;resize:vertical;min-height:60px;max-height:240px;line-height:1.5;}
+#teamchat-modal #tc-input:focus{outline:none;border-color:#2a93c1;box-shadow:0 0 0 3px rgba(42,147,193,0.2);}
+#teamchat-modal #tc-send{background:linear-gradient(135deg,#2a93c1,#f1420b);color:#fff;border:none;padding:12px 22px;border-radius:10px;cursor:pointer;font-weight:700;font-size:14px;white-space:nowrap;}
+#teamchat-modal #tc-send:hover{filter:brightness(1.1);}
+#teamchat-modal .tw-status-row{display:flex;justify-content:space-between;align-items:center;margin-top:8px;font-size:11px;color:#7a8aaa;}
+#teamchat-modal .tw-code-block{background:rgba(4,6,12,0.85);border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:10px 14px;margin:8px 0;overflow-x:auto;font-family:'SF Mono','Monaco','Menlo','Consolas',monospace;font-size:12px;line-height:1.5;}
+#teamchat-modal .tw-code-block code{background:transparent;border:none;padding:0;color:#e8eaf6;font-size:12px;display:block;white-space:pre;}
+#teamchat-modal .tw-inline-code{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.08);border-radius:4px;padding:1px 6px;font-family:'SF Mono','Monaco','Menlo','Consolas',monospace;font-size:12px;color:#f1420b;}
+#teamchat-modal .tw-h1{font-size:17px;font-weight:800;color:#fff;margin:8px 0 4px;}
+#teamchat-modal .tw-h2{font-size:15px;font-weight:700;color:#fff;margin:6px 0 3px;}
+#teamchat-modal .tw-h3{font-size:13px;font-weight:700;color:#e8eaf6;margin:4px 0 2px;text-transform:uppercase;letter-spacing:0.05em;}
+#teamchat-modal .tw-blockquote{border-left:3px solid rgba(42,147,193,0.5);padding:4px 10px;color:rgba(255,255,255,0.7);font-style:italic;margin:4px 0;}
+#teamchat-modal .tw-li{padding-left:12px;margin:1px 0;color:rgba(255,255,255,0.85);}
+#teamchat-modal .tw-msg-img{display:block;max-width:100%;max-height:300px;border-radius:8px;margin-top:8px;cursor:pointer;border:1px solid rgba(255,255,255,0.1);}
+#teamchat-modal .tw-file-link{display:inline-block;margin-top:8px;padding:6px 12px;background:rgba(255,255,255,0.06);border-radius:6px;color:#2a93c1;text-decoration:none;font-size:13px;}
+#teamchat-modal .tw-pending-preview{display:none;gap:8px;padding:8px 12px;background:rgba(42,147,193,0.08);border:1px solid rgba(42,147,193,0.25);border-radius:8px;margin:0 16px 8px;align-items:center;}
+#teamchat-modal .tw-pending-item{display:flex;gap:10px;align-items:center;flex:1;}
+#teamchat-modal .tw-pending-thumb{width:60px;height:60px;object-fit:cover;border-radius:6px;border:1px solid rgba(255,255,255,0.1);}
+#teamchat-modal .tw-pending-icon{font-size:32px;width:60px;height:60px;display:flex;align-items:center;justify-content:center;background:rgba(255,255,255,0.04);border-radius:6px;}
+#teamchat-modal .tw-pending-info{flex:1;min-width:0;}
+#teamchat-modal .tw-pending-name{font-size:13px;font-weight:600;color:#e8eaf6;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+#teamchat-modal .tw-pending-size{font-size:11px;color:#7a8aaa;}
+#teamchat-modal .tw-pending-remove{background:rgba(255,255,255,0.08);border:none;color:#e8eaf6;cursor:pointer;font-size:20px;padding:4px 8px;border-radius:6px;}
+@media (max-width:900px){
+  #teamchat-modal{width:100vw;left:0;}
+  #teamchat-modal .tw-shell{border-left:none;}
+  #teamchat-modal .tw-header{padding-top:max(14px,env(safe-area-inset-top));}
+  #teamchat-modal .tw-msg{max-width:92%;}
+  #teamchat-modal .tw-footer{padding-bottom:max(12px,env(safe-area-inset-bottom));}
+  #teamchat-modal #tc-input{font-size:16px;}
+  #teamchat-modal .tw-close{font-size:28px!important;padding:8px 16px!important;min-width:44px;min-height:44px;background:rgba(255,255,255,0.08)!important;border-radius:8px!important;}
+}
+</style>
+
+<!-- Team Chat modal HTML -->
+<div id="teamchat-modal" role="dialog" aria-modal="true" aria-label="Team Chat">
+  <div class="tw-shell">
+    <div class="tw-header">
+      <div class="tw-title">
+        <span class="tw-dots" id="tc-dots"></span>
+        Team Chat
+      </div>
+      <button class="tw-close" onclick="closeTeamChat()" aria-label="Close">&times;</button>
+    </div>
+    <div class="tw-feed" id="tc-feed"></div>
+    <div id="tc-pending-preview" class="tw-pending-preview"></div>
+    <div class="tw-footer">
+      <div class="tw-input-row">
+        <textarea id="tc-input" placeholder="Type a message to the team. Enter to send, Shift+Enter for newline." rows="1"></textarea>
+        <button id="tc-send" onclick="tcSend()">Send</button>
+      </div>
+      <div class="tw-status-row">
+        <span id="tc-status"></span>
+        <span style="font-size:10px;opacity:0.7;">Team Chat &middot; trio-comms</span>
+      </div>
+    </div>
+  </div>
+</div>
+<!-- ==================== END TEAM CHAT WIDGET ==================== -->
+
 
 </body>
 </html>

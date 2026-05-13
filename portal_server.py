@@ -3411,6 +3411,7 @@ async def _startup() -> None:
     await _init_referral_db()
     await _init_clients_db()
     await _init_agents_db()
+    _trio_init_db()
     asyncio.create_task(_thinking_monitor_loop())
     asyncio.create_task(_trim_portal_log_periodically())
     asyncio.create_task(_scheduled_task_checker())
@@ -9774,6 +9775,470 @@ async def api_tgim_proxy(request: Request) -> JSONResponse:
         return JSONResponse({"error": str(e)}, status_code=502)
 
 
+# ── Team Chat (embedded trio-comms, self-contained) ─────────────────────────
+# Full implementation of the trio-comms room/message system embedded in the portal.
+# Same schema and API shape as Aether's CF Worker, but backed by local SQLite.
+# Each portal instance is its own trio-comms. Room + AI tokens provisioned at birth.
+#
+# Auth model (matches CF Worker):
+#   - Portal bearer token → sender_id from TRIO_SENDER_ID env (default: portal owner)
+#   - Per-AI bearer tokens → sha256 hashed in team_chat.db ai_tokens table
+#   - Internal setup token → TRIO_SETUP_TOKEN env (for birth-pipeline provisioning)
+#
+# Env vars:
+#   TRIO_SENDER_ID    — sender_id for the portal human (e.g. "human:corey@example.com")
+#   TRIO_SETUP_TOKEN  — admin token for /trio/setup (room provisioning at birth)
+
+TRIO_DB_PATH = SCRIPT_DIR / "team-chat.db"
+TRIO_UPLOADS_DIR = SCRIPT_DIR / "team-chat-uploads"
+TRIO_SENDER_ID = os.environ.get("TRIO_SENDER_ID", "")
+TRIO_SETUP_TOKEN = os.environ.get("TRIO_SETUP_TOKEN", "")
+_TRIO_MAX_CONTENT = 100_000
+_TRIO_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+_TRIO_RATE_LIMIT_PER_MIN = 20
+_TRIO_ALLOWED_MIME_PREFIXES = ("image/", "audio/", "text/")
+_TRIO_ALLOWED_MIME_EXACT = {
+    "application/pdf", "application/json", "application/zip",
+    "audio/mpeg", "audio/wav", "audio/mp4", "audio/webm", "audio/ogg",
+}
+
+
+def _trio_allowed_mime(mime: str) -> bool:
+    if not mime:
+        return False
+    if mime in _TRIO_ALLOWED_MIME_EXACT:
+        return True
+    return any(mime.startswith(p) for p in _TRIO_ALLOWED_MIME_PREFIXES)
+
+
+def _trio_init_db():
+    """Create team-chat.db tables if they don't exist. Called at startup."""
+    TRIO_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(TRIO_DB_PATH))
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS rooms (
+            id TEXT PRIMARY KEY,
+            customer_id TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL,
+            archived_at INTEGER,
+            retention_days INTEGER NOT NULL DEFAULT 90,
+            attachment_bytes_used INTEGER NOT NULL DEFAULT 0,
+            storage_hard_cap_bytes INTEGER NOT NULL DEFAULT 5368709120
+        );
+        CREATE TABLE IF NOT EXISTS room_members (
+            room_id TEXT NOT NULL,
+            member_id TEXT NOT NULL,
+            member_type TEXT NOT NULL CHECK(member_type IN ('ai', 'human')),
+            display_name TEXT NOT NULL,
+            scopes_json TEXT NOT NULL DEFAULT '["read","write","upload"]',
+            joined_at INTEGER NOT NULL,
+            last_heartbeat_at INTEGER,
+            last_seq_seen INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (room_id, member_id)
+        );
+        CREATE TABLE IF NOT EXISTS room_seq_counters (
+            room_id TEXT PRIMARY KEY,
+            next_seq INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE TABLE IF NOT EXISTS messages (
+            id TEXT PRIMARY KEY,
+            room_id TEXT NOT NULL,
+            seq INTEGER,
+            timestamp TEXT NOT NULL,
+            sender_id TEXT NOT NULL,
+            content TEXT NOT NULL,
+            content_hash TEXT,
+            client_msg_id TEXT,
+            attachments_json TEXT DEFAULT '[]',
+            audit_log TEXT DEFAULT '[]'
+        );
+        CREATE INDEX IF NOT EXISTS idx_messages_room_seq ON messages(room_id, seq);
+        CREATE UNIQUE INDEX IF NOT EXISTS uniq_messages_client_idem
+            ON messages(room_id, client_msg_id) WHERE client_msg_id IS NOT NULL;
+        CREATE TABLE IF NOT EXISTS ai_tokens (
+            token_hash TEXT PRIMARY KEY,
+            customer_id TEXT NOT NULL,
+            ai_id TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            room_id TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            last_used_at INTEGER,
+            revoked_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_ai_tokens_customer_ai
+            ON ai_tokens(customer_id, ai_id) WHERE revoked_at IS NULL;
+    """)
+    conn.close()
+    print(f"[trio] team-chat.db initialized at {TRIO_DB_PATH}")
+
+
+def _trio_sha256(s: str) -> str:
+    return hashlib.sha256(s.encode()).hexdigest()
+
+
+def _trio_check_auth(request: Request) -> tuple:
+    """Check auth for trio endpoints. Returns (sender_id, member_type) or (None, None).
+    Three paths:
+      1. Portal bearer token → human sender
+      2. Per-AI bearer token → ai sender (hash lookup)
+      3. Setup token → internal (for /trio/setup only)
+    """
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        return None, None
+    tok = auth[7:].strip()
+
+    # Path 1: Portal owner token
+    if hmac.compare_digest(tok, BEARER_TOKEN) and TRIO_SENDER_ID:
+        return TRIO_SENDER_ID, "human"
+
+    # Path 2: Per-AI token (hash lookup in SQLite)
+    token_hash = _trio_sha256(tok)
+    try:
+        conn = sqlite3.connect(str(TRIO_DB_PATH))
+        row = conn.execute(
+            "SELECT customer_id, ai_id, display_name FROM ai_tokens WHERE token_hash = ? AND revoked_at IS NULL",
+            (token_hash,),
+        ).fetchone()
+        conn.close()
+        if row:
+            return f"ai:{row[0]}:{row[1]}", "ai"
+    except Exception:
+        pass
+
+    return None, None
+
+
+def _trio_alloc_seq(conn: sqlite3.Connection, room_id: str) -> int:
+    """Atomically allocate next sequence number for a room."""
+    conn.execute(
+        "INSERT INTO room_seq_counters (room_id, next_seq) VALUES (?, 2) "
+        "ON CONFLICT(room_id) DO UPDATE SET next_seq = next_seq + 1",
+        (room_id,),
+    )
+    row = conn.execute("SELECT next_seq FROM room_seq_counters WHERE room_id = ?", (room_id,)).fetchone()
+    return (row[0] if row else 1) - 1
+
+
+async def api_trio_messages(request: Request) -> JSONResponse:
+    """GET /trio/messages — fetch messages with cursor pagination."""
+    sender_id, _ = _trio_check_auth(request)
+    if not sender_id:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    params = request.query_params
+    since_seq = int(params.get("since_seq", "0"))
+    limit = min(int(params.get("limit", "50")), 200)
+
+    async with aiosqlite.connect(str(TRIO_DB_PATH)) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT id, seq, timestamp, sender_id, content, content_hash, client_msg_id, attachments_json, audit_log "
+            "FROM messages WHERE seq IS NOT NULL AND seq > ? ORDER BY seq ASC LIMIT ?",
+            (since_seq, limit),
+        )
+        rows = await cursor.fetchall()
+
+    messages = []
+    for r in rows:
+        atts = []
+        try:
+            atts = json.loads(r["attachments_json"] or "[]")
+        except Exception:
+            pass
+        messages.append({
+            "id": r["id"],
+            "seq": r["seq"],
+            "timestamp": r["timestamp"],
+            "sender": r["sender_id"],
+            "content": r["content"],
+            "content_hash": r["content_hash"],
+            "client_msg_id": r["client_msg_id"],
+            "attachments": atts,
+        })
+
+    next_seq = messages[-1]["seq"] if messages else since_seq
+    return JSONResponse({"messages": messages, "next_since_seq": next_seq})
+
+
+async def api_trio_send(request: Request) -> JSONResponse:
+    """POST /trio/message — send a message."""
+    sender_id, _ = _trio_check_auth(request)
+    if not sender_id:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+
+    content = body.get("content", "")
+    if not content:
+        return JSONResponse({"error": "content required"}, status_code=400)
+    if len(content) > _TRIO_MAX_CONTENT:
+        return JSONResponse({"error": "content too long"}, status_code=413)
+
+    client_msg_id = body.get("client_msg_id") or secrets.token_hex(16)
+    attachments = body.get("attachments", [])
+    msg_id = secrets.token_hex(16)
+    timestamp = datetime.now(timezone.utc).isoformat()
+    content_hash = _trio_sha256(content)
+
+    conn = sqlite3.connect(str(TRIO_DB_PATH))
+    try:
+        # Idempotency check
+        existing = conn.execute(
+            "SELECT id, seq, timestamp FROM messages WHERE client_msg_id = ?", (client_msg_id,)
+        ).fetchone()
+        if existing:
+            conn.close()
+            return JSONResponse({"id": existing[0], "seq": existing[1], "timestamp": existing[2], "idempotent": True})
+
+        seq = _trio_alloc_seq(conn, "default")
+        conn.execute(
+            "INSERT INTO messages (id, room_id, seq, timestamp, sender_id, content, content_hash, client_msg_id, attachments_json) "
+            "VALUES (?, 'default', ?, ?, ?, ?, ?, ?, ?)",
+            (msg_id, seq, timestamp, sender_id, content, content_hash, client_msg_id, json.dumps(attachments)),
+        )
+        conn.commit()
+    except Exception as e:
+        conn.close()
+        return JSONResponse({"error": str(e)}, status_code=500)
+    conn.close()
+
+    return JSONResponse({"id": msg_id, "seq": seq, "timestamp": timestamp})
+
+
+async def api_trio_upload(request: Request) -> JSONResponse:
+    """POST /trio/upload — upload a file attachment."""
+    sender_id, _ = _trio_check_auth(request)
+    if not sender_id:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    form = await request.form()
+    file = form.get("file")
+    if not file:
+        return JSONResponse({"error": "no file"}, status_code=400)
+
+    content = await file.read()
+    if len(content) > _TRIO_MAX_UPLOAD_BYTES:
+        return JSONResponse({"error": "file too large (max 25MB)"}, status_code=413)
+
+    mime = file.content_type or "application/octet-stream"
+    if not _trio_allowed_mime(mime):
+        return JSONResponse({"error": f"mime not allowed: {mime}"}, status_code=415)
+
+    ts = int(time.time() * 1000)
+    safe_name = re.sub(r"[^a-zA-Z0-9._-]", "_", file.filename or "file")[:120]
+    key = f"{ts}-{safe_name}"
+    dest = TRIO_UPLOADS_DIR / key
+    dest.write_bytes(content)
+
+    url = f"/trio/media/{key}"
+    return JSONResponse({
+        "key": key, "url": url, "mime": mime,
+        "size": len(content), "filename": file.filename,
+    }, status_code=201)
+
+
+async def api_trio_media(request: Request) -> Response:
+    """GET /trio/media/{key} — serve uploaded file."""
+    # Auth: portal token or AI token
+    sender_id, _ = _trio_check_auth(request)
+    if not sender_id:
+        # Also allow query param token for inline images
+        tok = request.query_params.get("token", "")
+        if not tok or not hmac.compare_digest(tok, BEARER_TOKEN):
+            return Response("unauthorized", status_code=401)
+
+    key = request.path_params.get("key", "")
+    safe_key = re.sub(r"[^a-zA-Z0-9._-]", "_", key)[:200]
+    path = TRIO_UPLOADS_DIR / safe_key
+    if not path.exists() or not path.is_file():
+        return Response("not found", status_code=404)
+
+    # Guess content type from extension
+    import mimetypes
+    ct, _ = mimetypes.guess_type(str(path))
+    ct = ct or "application/octet-stream"
+
+    return FileResponse(str(path), media_type=ct, headers={
+        "Cache-Control": "private, max-age=300",
+        "X-Robots-Tag": "noindex",
+    })
+
+
+async def api_trio_presence(request: Request) -> JSONResponse:
+    """GET /trio/presence — list members with online/stale/offline status."""
+    sender_id, _ = _trio_check_auth(request)
+    if not sender_id:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    now = int(time.time() * 1000)
+    async with aiosqlite.connect(str(TRIO_DB_PATH)) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT member_id, member_type, display_name, last_heartbeat_at, last_seq_seen FROM room_members"
+        )
+        rows = await cursor.fetchall()
+
+    presence = []
+    for r in rows:
+        hb = r["last_heartbeat_at"] or 0
+        age = now - hb if hb else float("inf")
+        status = "online" if age < 90_000 else ("stale" if age < 300_000 else "offline")
+        presence.append({
+            "member_id": r["member_id"],
+            "member_type": r["member_type"],
+            "display_name": r["display_name"],
+            "last_heartbeat_at": r["last_heartbeat_at"],
+            "last_seq_seen": r["last_seq_seen"],
+            "status": status,
+        })
+
+    return JSONResponse({"server_now": now, "presence": presence})
+
+
+async def api_trio_heartbeat(request: Request) -> JSONResponse:
+    """POST /trio/heartbeat — AI presence ping."""
+    sender_id, _ = _trio_check_auth(request)
+    if not sender_id:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+
+    now = int(time.time() * 1000)
+    last_seq = body.get("last_seq_seen")
+
+    async with aiosqlite.connect(str(TRIO_DB_PATH)) as db:
+        if last_seq is not None and isinstance(last_seq, (int, float)) and last_seq >= 0:
+            await db.execute(
+                "UPDATE room_members SET last_heartbeat_at = ?, last_seq_seen = MAX(last_seq_seen, ?) WHERE member_id = ?",
+                (now, int(last_seq), sender_id),
+            )
+        else:
+            await db.execute(
+                "UPDATE room_members SET last_heartbeat_at = ? WHERE member_id = ?",
+                (now, sender_id),
+            )
+        await db.commit()
+
+    return JSONResponse({"ok": True, "server_now": now})
+
+
+async def api_trio_setup(request: Request) -> JSONResponse:
+    """POST /trio/setup — provision room + members + AI tokens.
+    Called during birth pipeline. Requires TRIO_SETUP_TOKEN.
+    Body: { customer_id, ai_ids: [{id, display_name}], human: {id, display_name} }
+    Returns: { room_id, members, ai_tokens: [{ai_id, token, display_name}] }
+    """
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    tok = auth[7:].strip()
+    if not TRIO_SETUP_TOKEN or not hmac.compare_digest(tok, TRIO_SETUP_TOKEN):
+        # Also allow portal bearer token for admin setup
+        if not hmac.compare_digest(tok, BEARER_TOKEN):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+
+    customer_id = body.get("customer_id", "").strip()
+    if not customer_id:
+        return JSONResponse({"error": "customer_id required"}, status_code=400)
+    ai_ids = body.get("ai_ids", [])
+    human = body.get("human")
+
+    room_id = f"room_{customer_id}"
+    now = int(time.time() * 1000)
+
+    conn = sqlite3.connect(str(TRIO_DB_PATH))
+    try:
+        # Upsert room
+        conn.execute(
+            "INSERT OR IGNORE INTO rooms (id, customer_id, name, created_at) VALUES (?, ?, '', ?)",
+            (room_id, customer_id, now),
+        )
+        # Seed seq counter
+        conn.execute(
+            "INSERT OR IGNORE INTO room_seq_counters (room_id, next_seq) VALUES (?, 1)",
+            (room_id,),
+        )
+
+        # Upsert AI members + mint tokens
+        ai_tokens = []
+        for ai in ai_ids:
+            ai_id = ai.get("id", "") if isinstance(ai, dict) else str(ai)
+            display_name = ai.get("display_name", ai_id) if isinstance(ai, dict) else str(ai)
+            member_id = f"ai:{customer_id}:{ai_id}"
+
+            conn.execute(
+                "INSERT OR IGNORE INTO room_members (room_id, member_id, member_type, display_name, scopes_json, joined_at) "
+                "VALUES (?, ?, 'ai', ?, '[\"read\",\"write\",\"upload\"]', ?)",
+                (room_id, member_id, display_name, now),
+            )
+
+            # Check existing token
+            existing = conn.execute(
+                "SELECT token_hash FROM ai_tokens WHERE customer_id = ? AND ai_id = ? AND revoked_at IS NULL",
+                (customer_id, ai_id),
+            ).fetchone()
+            if existing:
+                ai_tokens.append({"ai_id": ai_id, "display_name": display_name, "token": None, "already_minted": True})
+                continue
+
+            # Mint new token
+            token_plaintext = secrets.token_urlsafe(32)
+            token_hash = _trio_sha256(token_plaintext)
+            conn.execute(
+                "INSERT INTO ai_tokens (token_hash, customer_id, ai_id, display_name, room_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (token_hash, customer_id, ai_id, display_name, room_id, now),
+            )
+            ai_tokens.append({"ai_id": ai_id, "display_name": display_name, "token": token_plaintext, "already_minted": False})
+
+        # Upsert human member
+        if human:
+            human_id = human.get("id", "")
+            human_display = human.get("display_name", human_id)
+            if human_id:
+                conn.execute(
+                    "INSERT OR IGNORE INTO room_members (room_id, member_id, member_type, display_name, scopes_json, joined_at) "
+                    "VALUES (?, ?, 'human', ?, '[\"read\",\"write\",\"upload\"]', ?)",
+                    (room_id, human_id, human_display, now),
+                )
+
+        conn.commit()
+
+        # Return member list
+        members = conn.execute(
+            "SELECT member_id, member_type, display_name, joined_at FROM room_members WHERE room_id = ?",
+            (room_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    return JSONResponse({
+        "room_id": room_id,
+        "members": [{"member_id": m[0], "member_type": m[1], "display_name": m[2], "joined_at": m[3]} for m in members],
+        "ai_tokens": ai_tokens,
+    })
+
+
+async def api_trio_health(request: Request) -> JSONResponse:
+    """GET /trio/health — team chat health check."""
+    ok = TRIO_DB_PATH.exists()
+    return JSONResponse({"ok": ok, "version": "embedded-v1", "db": str(TRIO_DB_PATH)})
+
+
 routes = [
     Route("/favicon.ico", endpoint=favicon),
     Route("/favicon-32.png", endpoint=favicon_png),
@@ -9886,6 +10351,23 @@ routes = [
     Route("/api/continue", endpoint=api_hub_continue, methods=["POST"]),
     Route("/api/restart", endpoint=api_hub_restart, methods=["POST"]),
     Route("/api/tgim/{path:path}", endpoint=api_tgim_proxy, methods=["GET", "POST", "PUT", "PATCH", "DELETE"]),
+    # ── Team Chat (embedded trio-comms) ──
+    Route("/trio/messages", endpoint=api_trio_messages),
+    Route("/trio/message", endpoint=api_trio_send, methods=["POST"]),
+    Route("/trio/upload", endpoint=api_trio_upload, methods=["POST"]),
+    Route("/trio/media/{key:path}", endpoint=api_trio_media),
+    Route("/trio/presence", endpoint=api_trio_presence),
+    Route("/trio/heartbeat", endpoint=api_trio_heartbeat, methods=["POST"]),
+    Route("/trio/setup", endpoint=api_trio_setup, methods=["POST"]),
+    Route("/trio/health", endpoint=api_trio_health),
+    # CF Worker-compatible /rooms/* aliases (poller/heartbeat use these paths)
+    Route("/rooms/{room_id}/messages", endpoint=api_trio_messages),
+    Route("/rooms/{room_id}/messages", endpoint=api_trio_send, methods=["POST"]),
+    Route("/rooms/{room_id}/upload", endpoint=api_trio_upload, methods=["POST"]),
+    Route("/rooms/{room_id}/presence", endpoint=api_trio_presence),
+    Route("/rooms/{room_id}/heartbeat", endpoint=api_trio_heartbeat, methods=["POST"]),
+    Route("/rooms/ensure", endpoint=api_trio_setup, methods=["POST"]),
+    Route("/health", endpoint=api_trio_health),
     WebSocketRoute("/ws/chat", endpoint=ws_chat),
     WebSocketRoute("/ws/terminal", endpoint=ws_terminal),
     *_custom_routes,   # Flux overlay: custom routes from custom/routes.py
