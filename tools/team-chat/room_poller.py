@@ -215,11 +215,11 @@ def download_attachment(cfg, attachment):
 
 
 def inject_prompt_hint(text, max_retries=3, retry_delay=3):
-    """Write a context hint into the AI's tmux session with Enter-retry.
+    """Write a context hint into the AI's tmux session with blind Enter-retry.
 
-    Sends the text + Enter, then waits and re-sends Enter up to max_retries
-    times if the text appears to still be sitting in the input buffer
-    (i.e., the prompt wasn't ready to accept it).
+    Sends the text + Enter, then waits 3 seconds and re-sends Enter.
+    Repeats up to max_retries times. No pane checking — just send Enter
+    on a fixed interval until we've retried enough.
 
     Best-effort. Silent fail if no tmux session is available."""
     try:
@@ -236,41 +236,65 @@ def inject_prompt_hint(text, max_retries=3, retry_delay=3):
             timeout=5,
         )
 
-        # Retry loop: wait, then send Enter again if needed
+        # Blind retry: wait 3s, hit Enter again. Repeat.
         for attempt in range(max_retries):
             time.sleep(retry_delay)
-            # Capture the current pane content to check if our text is stuck
-            result = subprocess.run(
-                ["tmux", "capture-pane", "-t", sess, "-p", "-l", "5"],
-                capture_output=True, text=True, timeout=5,
+            log.info("inject retry %d/%d — sending Enter", attempt + 1, max_retries)
+            subprocess.run(
+                ["tmux", "send-keys", "-t", sess, "Enter"],
+                check=False,
+                timeout=5,
             )
-            pane_tail = result.stdout.strip() if result.stdout else ""
-            # If our text (or a truncated version) is visible in the last few
-            # lines of the pane, it may be stuck in the input buffer — hit Enter
-            # Check for the room/seq prefix which is distinctive
-            text_prefix = text[:60] if len(text) > 60 else text
-            if text_prefix in pane_tail:
-                log.info("inject retry %d/%d — text still in pane, sending Enter",
-                         attempt + 1, max_retries)
-                subprocess.run(
-                    ["tmux", "send-keys", "-t", sess, "Enter"],
-                    check=False,
-                    timeout=5,
-                )
-            else:
-                # Text is gone from pane — injection succeeded
-                log.debug("inject confirmed after %d retries", attempt)
-                return True
 
-        log.warning("inject exhausted %d retries — text may be stuck", max_retries)
-        return True  # We tried our best
+        return True
     except Exception as e:
         log.debug("tmux inject failed: %s", e)
         return False
 
 
+def _send_email_backup(cfg, sender_label, seq, content):
+    """Send team chat message as email backup via AgentMail.
+
+    Config keys in room-config.json:
+      agentmail_inbox:   e.g. "synth_aiciv@agentmail.to"
+      agentmail_api_key: AgentMail API bearer token
+      email_backup:      "always" | "on_fail" | "off" (default: "off")
+    """
+    inbox = cfg.get("agentmail_inbox", "")
+    api_key = cfg.get("agentmail_api_key", "")
+    if not inbox or not api_key:
+        return False
+
+    try:
+        subject = f"[Team Chat seq:{seq}] {sender_label}"
+        body = f"Team Chat message (seq {seq}):\n\nFrom: {sender_label}\n\n{content}"
+
+        payload = json.dumps({
+            "to": inbox,
+            "subject": subject,
+            "text": body,
+        }).encode()
+
+        req = urllib.request.Request(
+            f"https://api.agentmail.to/v0/inboxes/{inbox}/messages/send",
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            log.info("email backup sent for seq=%s to %s", seq, inbox)
+            return True
+    except Exception as e:
+        log.warning("email backup failed for seq=%s: %s", seq, e)
+        return False
+
+
 def handle_message(cfg, msg):
-    """Process a single message: download attachments, inject hint into tmux."""
+    """Process a single message: download attachments, inject hint into tmux,
+    and optionally send email backup via AgentMail."""
     seq = msg.get("seq")
     sender = msg.get("sender", "")
     content = msg.get("content", "")
@@ -298,8 +322,17 @@ def handle_message(cfg, msg):
     for p in saved_paths:
         parts.append(f"[attachment {'IMAGE' if has_image else 'FILE'} saved: {p}]")
     hint = " ".join(parts)
-    inject_prompt_hint(hint)
-    log.info("message seq=%s sender=%s attachments=%d", seq, sender, len(saved_paths))
+    tmux_ok = inject_prompt_hint(hint)
+
+    # Email backup: send via AgentMail if configured
+    email_mode = cfg.get("email_backup", "off")
+    if email_mode == "always":
+        _send_email_backup(cfg, sender, seq, content)
+    elif email_mode == "on_fail" and not tmux_ok:
+        _send_email_backup(cfg, sender, seq, content)
+
+    log.info("message seq=%s sender=%s attachments=%d tmux=%s email_backup=%s",
+             seq, sender, len(saved_paths), "ok" if tmux_ok else "FAIL", email_mode)
 
 
 def _owner_customer_id(cfg):
