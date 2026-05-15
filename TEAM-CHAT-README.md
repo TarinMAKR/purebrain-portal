@@ -6,6 +6,51 @@ Self-contained team chat system embedded in the PureBrain portal. Based on Aethe
 
 Human + N AIs in a single persistent conversation inside the portal. Messages, file uploads, presence indicators, markdown rendering, code highlighting.
 
+## Quick Start (Fresh Install)
+
+```bash
+# 1. Install dependencies
+pip install aiosqlite httpx
+
+# 2. Add env vars to your .env file
+echo 'TRIO_SENDER_ID=human:yourname@example.com' >> .env
+echo "TRIO_SETUP_TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')" >> .env
+
+# 3. Start the portal (team-chat.db created automatically)
+python3 portal_server.py
+
+# 4. Provision a room
+PORTAL_TOKEN=$(cat .portal-token)
+curl -X POST http://localhost:8097/trio/setup \
+  -H "Authorization: Bearer $PORTAL_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "customer_id": "my-team",
+    "ai_ids": [{"id": "my-ai", "display_name": "My AI"}],
+    "human": {"id": "human:yourname@example.com", "display_name": "Your Name"}
+  }'
+# Save the ai_token from the response!
+
+# 5. Configure the AI's poller
+mkdir -p ~/duo
+cat > ~/duo/room-config.json << EOF
+{
+  "room_id": "room_my-team",
+  "ai_id": "my-ai",
+  "ai_token": "<token from step 4>",
+  "trio_comms_url": "http://localhost:8097",
+  "last_seq_seen": 0
+}
+EOF
+chmod 600 ~/duo/room-config.json
+
+# 6. Start poller + heartbeat (MUST be separate processes)
+nohup python3 tools/team-chat/room_poller.py > ~/duo/logs/room_poller.log 2>&1 &
+nohup python3 tools/team-chat/room_heartbeat.py > ~/duo/logs/room_heartbeat.log 2>&1 &
+
+# 7. Open the portal — click Team Chat in the sidebar
+```
+
 ## Architecture
 
 ```
@@ -116,7 +161,39 @@ At birth time (when customer buys 2nd AI seat):
 The Team Chat widget is injected into `portal-pb-styled.html` at the bottom. It adds:
 - Sidebar nav item "Team Chat"
 - Mobile menu item
-- Full-screen modal with message feed, input, presence dots
-- Dynamic participant colors (no hardcoded names)
-- Markdown + code block rendering with syntax highlighting
+- Right-docked side panel (400px wide, main content shrinks to fit)
+- Full-width on mobile (<900px)
+- Dynamic participant colors from /trio/presence (no hardcoded names)
+- Presence dots in header (green=online, yellow=stale, red=offline)
+- Markdown + code block rendering with syntax highlighting (highlight.js)
 - File upload (drag-drop, paste)
+- Enter to send, Shift+Enter for newline, Escape to close
+
+## CF Worker Compatibility
+
+The portal also exposes `/rooms/*` route aliases matching the Cloudflare Worker API shape:
+- `GET /rooms/{room_id}/messages` → same as `/trio/messages`
+- `POST /rooms/{room_id}/messages` → same as `/trio/message`
+- `POST /rooms/{room_id}/heartbeat` → same as `/trio/heartbeat`
+- `GET /rooms/{room_id}/presence` → same as `/trio/presence`
+- `POST /rooms/ensure` → same as `/trio/setup`
+
+This means the poller/heartbeat scripts work identically whether pointed at
+a local portal or the production CF Worker — no code changes needed.
+
+## Troubleshooting
+
+**Poller/heartbeat die silently**: These run as background processes. Use systemd
+or a watchdog script for production. Check `~/duo/logs/` for error logs.
+
+**Messages stuck in tmux input**: The poller has an Enter-retry mechanism (waits 3s,
+checks if text is still in the pane, re-sends Enter up to 3 times). If the AI is
+mid-response, messages queue until the next prompt.
+
+**502 errors in widget**: Usually a momentary hiccup during portal restart. Hard
+refresh clears it. If persistent, check `portal_server.py` logs.
+
+**Presence shows offline**: Heartbeat daemon may have died. Restart it:
+```bash
+nohup python3 tools/team-chat/room_heartbeat.py > ~/duo/logs/room_heartbeat.log 2>&1 &
+```
