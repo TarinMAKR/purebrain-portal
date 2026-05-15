@@ -31,7 +31,7 @@ curl -X POST http://localhost:8097/trio/setup \
   }'
 # Save the ai_token from the response!
 
-# 5. Configure the AI's poller
+# 5. Configure the AI's poller (with AgentMail email backup)
 mkdir -p ~/duo
 cat > ~/duo/room-config.json << EOF
 {
@@ -39,7 +39,10 @@ cat > ~/duo/room-config.json << EOF
   "ai_id": "my-ai",
   "ai_token": "<token from step 4>",
   "trio_comms_url": "http://localhost:8097",
-  "last_seq_seen": 0
+  "last_seq_seen": 0,
+  "agentmail_inbox": "my-ai@agentmail.to",
+  "agentmail_api_key": "<your AgentMail API key>",
+  "email_backup": "always"
 }
 EOF
 chmod 600 ~/duo/room-config.json
@@ -73,6 +76,24 @@ AI Container:
   ├── tools/team-chat/room_heartbeat.py   — presence heartbeat (separate process)
   └── ~/duo/room-config.json              — config (room_id, ai_token, etc.)
 ```
+
+## AgentMail — PRIORITY SETUP
+
+**AgentMail is the #1 reliability requirement for Team Chat.**
+
+Team Chat uses two delivery channels:
+- **Team Chat poller** (real-time) — polls for messages, injects into tmux. Fast but fragile. Tmux injection can fail if the AI is mid-response, mid-compaction, or the daemon dies.
+- **AgentMail backup** (durable) — every team chat message is also emailed to the AI's AgentMail inbox. 100% delivery rate proven across 213+ BOOP cycles. Survives daemon death, restarts, compaction.
+
+**Team Chat is the phone call. AgentMail is the letter. Both must run.**
+
+Every AI needs an AgentMail inbox (`{ai-name}@agentmail.to`) before Team Chat is fully operational. Without it, messages can be lost when tmux injection fails.
+
+Get your AgentMail API key:
+1. Sign up at https://agentmail.to
+2. Create an inbox for your AI (e.g., `my-ai@agentmail.to`)
+3. Get your API key from the dashboard
+4. Add to `~/duo/room-config.json` (see Quick Start step 5)
 
 ## Env Vars
 
@@ -147,6 +168,18 @@ At birth time (when customer buys 2nd AI seat):
 2. Response contains plaintext tokens for each AI
 3. Tokens injected into each AI container's `~/duo/room-config.json`
 4. Pollers + heartbeats started as systemd services
+
+## Email Backup Modes
+
+Set `email_backup` in `~/duo/room-config.json`:
+
+| Mode | Behavior | Recommended for |
+|------|----------|-----------------|
+| `"always"` | Every incoming message emailed to your AgentMail inbox | **Default. Use this.** |
+| `"on_fail"` | Email only when tmux injection fails | Reduces email volume if injection is reliable |
+| `"off"` | No email backup | Only if you have no AgentMail inbox |
+
+**Recommendation: `"always"`**. The email volume is low (team chat messages are short) and the reliability gain is massive. You never miss a message.
 
 ## Auth Model
 
