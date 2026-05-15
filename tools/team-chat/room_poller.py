@@ -214,12 +214,15 @@ def download_attachment(cfg, attachment):
     return path
 
 
-def inject_prompt_hint(text, max_retries=2, retry_delay=3):
-    """Write a context hint into the AI's tmux session with blind Enter-retry.
+def inject_prompt_hint(text):
+    """Write a context hint into the AI's tmux session.
 
-    Sends the text + Enter, then waits 3 seconds and re-sends Enter.
-    Repeats up to max_retries times. No pane checking — just send Enter
-    on a fixed interval until we've retried enough.
+    Matches the portal_server.py proven injection pattern:
+    1. Leading newline clears any partial input in the tmux buffer
+    2. send-keys -l (literal) for the message text
+    3. One Enter to submit
+    4. 5x Enter retries at 0.5s intervals (ensures delivery even when
+       Claude Code is busy with tool calls or generation)
 
     Best-effort. Silent fail if no tmux session is available."""
     try:
@@ -229,21 +232,25 @@ def inject_prompt_hint(text, max_retries=2, retry_delay=3):
         if not sess:
             return False
 
-        # First attempt: type the text + Enter
+        # Leading newline + literal text
         subprocess.run(
-            ["tmux", "send-keys", "-t", sess, text, "Enter"],
-            check=False,
+            ["tmux", "send-keys", "-t", sess, "-l", f"\n{text}"],
+            check=True,
             timeout=5,
         )
-
-        # Blind retry: wait 3s, hit Enter again. Repeat.
-        for attempt in range(max_retries):
-            time.sleep(retry_delay)
-            log.info("inject retry %d/%d — sending Enter", attempt + 1, max_retries)
+        # First Enter
+        subprocess.run(
+            ["tmux", "send-keys", "-t", sess, "Enter"],
+            check=True,
+            timeout=5,
+        )
+        # 5x Enter retries at 0.5s — proven pattern from portal_server.py
+        for i in range(5):
+            time.sleep(0.5)
             subprocess.run(
                 ["tmux", "send-keys", "-t", sess, "Enter"],
                 check=False,
-                timeout=5,
+                timeout=3,
             )
 
         return True
