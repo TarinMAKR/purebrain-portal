@@ -214,7 +214,7 @@ def download_attachment(cfg, attachment):
     return path
 
 
-def inject_prompt_hint(text, max_retries=3, retry_delay=3):
+def inject_prompt_hint(text, max_retries=2, retry_delay=3):
     """Write a context hint into the AI's tmux session with blind Enter-retry.
 
     Sends the text + Enter, then waits 3 seconds and re-sends Enter.
