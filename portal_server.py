@@ -2100,8 +2100,10 @@ async def api_resume(request: Request) -> JSONResponse:
         # Write session name so portal can track it
         marker = Path.home() / ".current_session"
         marker.write_text(tmux_session)
+        model_file = Path.home() / ".claude_session_model"
+        model = model_file.read_text().strip() if model_file.exists() else "claude-opus-4-6"
         claude_cmd = (
-            f"claude --model claude-sonnet-4-6 --dangerously-skip-permissions "
+            f"claude --model {model} --dangerously-skip-permissions "
             f"--resume {session_id}"
         )
         # Popen is fire-and-forget so we use run_in_executor to avoid blocking
@@ -9473,7 +9475,7 @@ async def api_hub_continue(request: Request) -> JSONResponse:
         marker.write_text(tmux_session)
         # Use default model — each CIV may have different config
         model_file = Path.home() / ".claude_session_model"
-        model = model_file.read_text().strip() if model_file.exists() else "claude-sonnet-4-6[1m]"
+        model = model_file.read_text().strip() if model_file.exists() else "claude-opus-4-6"
         claude_cmd = (
             f"claude --model {model} --dangerously-skip-permissions "
             f"--continue"
@@ -9514,7 +9516,7 @@ async def api_hub_restart(request: Request) -> JSONResponse:
         marker = Path.home() / ".current_session"
         marker.write_text(tmux_session)
         model_file = Path.home() / ".claude_session_model"
-        model = model_file.read_text().strip() if model_file.exists() else "claude-sonnet-4-6[1m]"
+        model = model_file.read_text().strip() if model_file.exists() else "claude-opus-4-6"
         claude_cmd = (
             f"claude --model {model} --dangerously-skip-permissions"
         )
